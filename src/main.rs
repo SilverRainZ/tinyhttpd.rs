@@ -1,40 +1,72 @@
-use std::str;
 use std::io::prelude::*;
+use std::str;
+use std::fs::File;
 use std::net::{TcpStream, TcpListener};
 
-static WELCOME: &'static str = "HTTP/1.0 200 OK\r\n\
+/* const string and bytes */
+
+static SERVER_HEADER: &'static [u8] =
+    b"HTTP/1.0 200 OK\r\n\
+      Content-type: text/html; charset=utf-8\r\n\
+      Server: tinyhttpd.rs/0.1.0\r\n\
+      \r\n";
+
+fn welcome() -> &'static [u8] {
+    "HTTP/1.0 200 OK\r\n\
      Content-type: text/html; charset=utf-8\r\n\
      \r\n\
-     <html>
-        <head>
-            <title>君の名は!</title>
-        </head>
-        <body>
-            <center>
-                <h1>Welcome!</h1>
-                <p>君の名は!</p>
-            </center>
-        </body>
-     </html>
-     \0";
-
-struct HttpRequest {
-    /* request line */
-    method: String,
-    rawuri: String,
-    version: String,
-    // args
-
-    /* request header */
-    // header: HttpHeader,
-    content_type: String,
-    content_length: u32,
-
-    /* request body */
-    body: String,
+     <html>\
+        <head>\
+            <title>君の名は!</title>\
+        </head>\
+        <body>\
+            <center>\
+                <h1>Welcome!</h1>\
+                <p>君の名は!</p>\
+            </center>\
+        </body>\
+     </html>".as_bytes()
 }
 
-fn accept_request(mut stream: TcpStream) {
+fn not_found() -> &'static [u8] {
+    "HTTP/1.0 404 NOT FOUND\r\n\
+     Content-Type: text/html; charset=utf-8\r\n\
+     \r\n\
+     <html>\
+        <title>404 Not Found</title>\
+        <body>\
+            <center>\
+                <h1>Not Found!</h1>\
+                <p>忘れた</p>\
+            </center>\
+        </body>\
+     </html>\r\n".as_bytes()
+}
+
+/* struct */
+
+struct HttpHeadEntry<'req> {
+    key: &'req str,
+    val: &'req str,
+}
+
+struct HttpRequest<'req> {
+    /* request line */
+    method: &'req str,
+    uri: &'req str,
+    version: &'req str,
+    args: &'req str,
+
+    /* request header */
+    head_entrys: Vec<HttpHeadEntry<'req>>,
+
+    /* request body */
+    body: &'req str,
+}
+
+/* implement */
+
+fn accept(mut stream: TcpStream) {
     let mut buf = [0; 512];
     // let mut req: HttpRequest = HttpRequest{ .. };
 
@@ -45,7 +77,16 @@ fn accept_request(mut stream: TcpStream) {
         Err(e) => panic!("invaild utf-8 sequcence {}", e),
     };
 
-    let mut line = s.split("\r\n");
+    let req = match parse(s) {
+        Some(v) => v,
+        None => panic!("failed to parse http request"),
+    };
+
+    response(stream, req);
+}
+
+fn parse(req: &str) -> Option<HttpRequest> {
+    let mut line = req.split("\r\n");
 
     /* read request line */
     let req_line = match line.next() {
@@ -81,13 +122,88 @@ fn accept_request(mut stream: TcpStream) {
     println!("version: {}", version);
 
     /* read request header */
-    let req_header = match line.next() {
-        Some(v) => v,
-        None => panic!("no request header found"),
-    };
-    println!("request header: {}", req_header);
+    let mut head_entrys: Vec<HttpHeadEntry> = Vec::new();
+    loop {
+        let req_header = match line.next() {
+            Some("") => break,  // end of header
+            Some(v) => v,
+            None => panic!("no request header found"),
+        };
 
-    stream.write(WELCOME.as_bytes()).unwrap();
+        let head_entry = match req_header.find(": ") {
+            Some(idx) => {
+                let (key, val) = req_header.split_at(idx);
+                let val = &val[2..]; // skip ": "
+                HttpHeadEntry { key: key, val: val }
+            }
+            None => panic!("no value found in header '{}'", req_header),
+        };
+
+        println!("header: key: {}, val: {}", head_entry.key, head_entry.val);
+        head_entrys.push(head_entry);
+    }
+
+    /* read request body */
+    let req_body = match line.next() {
+        Some(v) => v,
+        None => "", // OK?
+    };
+    println!("request body: {}", req_body);
+
+    Some(HttpRequest {
+        method: method, uri: rawuri, version: version, args: "",
+        head_entrys: head_entrys,
+        body: req_body,
+    })
+}
+
+fn response(mut stream: TcpStream, mut req: HttpRequest) {
+    let mut cgi = match req.method {
+        "POST" => true,
+        "GET" => match req.uri.find("?") {
+            Some(idx) => {
+                let (uri, args) = req.uri.split_at(idx);
+                    let args = &args[1..]; // skip "?"
+                    req.uri = uri;
+                    req.args = args;
+                    true
+            },
+            None => false,
+        },
+        _ => panic!("unsupported method"),
+    };
+
+    /* internal location */
+    if req.uri == "/welcome" {
+        stream.write(welcome()).unwrap();
+        return;
+    }
+
+    let path = match req.uri.chars().last() {
+        Some('/') =>  "root".to_string() + req.uri + "index.html",
+        _ => "root".to_string() + req.uri,
+    };
+
+    println!("cgi: {}, path: {}", cgi, path);
+
+    let mut buf = [0; 512];
+
+    match File::open(path) {
+        Ok(mut f) => {
+            f.read(&mut buf).unwrap();
+            stream.write(SERVER_HEADER).unwrap();
+            stream.write(&buf).unwrap();
+        },
+        Err(e) => {
+            // println!("failed to open {}: {}", path, e); // TODO
+            println!("failed to open: {}", e);
+            stream.write(not_found()).unwrap();
+        }
+    }
+}
+
+fn cgi(path: &str, args: &str) {
+
 }
 
 fn main() {
@@ -102,7 +218,7 @@ fn main() {
     for stream in listenser.incoming() {
         match stream {
             Ok(stream) => {
-                accept_request(stream);
+                accept(stream);
             }
             Err(e) => {
                 panic!(e);
