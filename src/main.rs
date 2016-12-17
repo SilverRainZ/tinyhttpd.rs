@@ -1,3 +1,18 @@
+/******************************************************************************
+ *  tinyhttpd.rs - Tiny http server implement via rust.
+ *  SilverRainZ <silverrain.zhang at gmail dot com>
+ *
+ *  - [x] http requset parse
+ *  - [ ] url arguments reslove
+ *  - [x] static file handle
+ *  - [ ] cgi execute
+ *  - [ ] dot removal procedure (RFC 3986)
+ *
+ *****************************************************************************/
+
+#[macro_use]
+extern crate log;
+
 use std::io::prelude::*;
 use std::str;
 use std::fs::File;
@@ -5,7 +20,7 @@ use std::net::{TcpStream, TcpListener};
 
 /* const string and bytes */
 
-static SERVER_HEADER: &'static [u8] =
+static RESPONSE_HEADER: &'static [u8] =
     b"HTTP/1.0 200 OK\r\n\
       Content-type: text/html; charset=utf-8\r\n\
       Server: tinyhttpd.rs/0.1.0\r\n\
@@ -72,17 +87,15 @@ fn accept(mut stream: TcpStream) {
 
     stream.read(&mut buf).unwrap();
 
-    let s = match str::from_utf8(&buf) {
-        Ok(v) => v,
-        Err(e) => panic!("invaild utf-8 sequcence {}", e),
-    };
-
-    let req = match parse(s) {
-        Some(v) => v,
-        None => panic!("failed to parse http request"),
-    };
-
-    response(stream, req);
+    match str::from_utf8(&buf) {
+        Ok(s) => {
+            match parse(s) {
+                Some(req) => response(stream, req),
+                None => error!("failed to parse http request"),
+            }
+        },
+        Err(e) => error!("invaild utf-8 sequcence {}", e),
+    }
 }
 
 fn parse(req: &str) -> Option<HttpRequest> {
@@ -91,35 +104,48 @@ fn parse(req: &str) -> Option<HttpRequest> {
     /* read request line */
     let req_line = match line.next() {
         Some(v) => v,
-        None => panic!("no request line found"),
+        None => {
+            warn!("no request line found");
+            return None;
+        }
     };
-    println!("request line: {}", req_line);
+    debug!("request line: {}", req_line);
 
     let mut req_line =  req_line.split_whitespace();
 
     let method = match req_line.next() {
         Some(v) => {
             if v != "POST" && v != "GET" {
-                panic!("unsupported method");
+                warn!("unsupported method");
+                return None;
             } else {
                 v
             }
         },
-        None => panic!("no method found in request line"),
+        None => {
+            warn!("no method found in request line");
+            return None;
+        }
     };
-    println!("method: {}", method);
+    debug!("method: {}", method);
 
     let rawuri = match req_line.next() {
         Some(v) => v,
-        None => panic!("no uri found in request line"),
+        None => {
+            warn!("no uri found in request line");
+            return None;
+        }
     };
-    println!("rawuri: {}", rawuri);
+    debug!("rawuri: {}", rawuri);
 
     let version = match req_line.next() {
         Some(v) => v,
-        None => panic!("no version found in request line"),
+        None => {
+            warn!("no version found in request line");
+            return None;
+        }
     };
-    println!("version: {}", version);
+    debug!("version: {}", version);
 
     /* read request header */
     let mut head_entrys: Vec<HttpHeadEntry> = Vec::new();
@@ -127,7 +153,10 @@ fn parse(req: &str) -> Option<HttpRequest> {
         let req_header = match line.next() {
             Some("") => break,  // end of header
             Some(v) => v,
-            None => panic!("no request header found"),
+            None => {
+                warn!("no request header found");
+                return None;
+            }
         };
 
         let head_entry = match req_header.find(": ") {
@@ -135,11 +164,14 @@ fn parse(req: &str) -> Option<HttpRequest> {
                 let (key, val) = req_header.split_at(idx);
                 let val = &val[2..]; // skip ": "
                 HttpHeadEntry { key: key, val: val }
+            },
+            None => {
+                warn!("no value found in header '{}'", req_header);
+                return None
             }
-            None => panic!("no value found in header '{}'", req_header),
         };
 
-        println!("header: key: {}, val: {}", head_entry.key, head_entry.val);
+        debug!("header: key: {}, val: {}", head_entry.key, head_entry.val);
         head_entrys.push(head_entry);
     }
 
@@ -148,7 +180,9 @@ fn parse(req: &str) -> Option<HttpRequest> {
         Some(v) => v,
         None => "", // OK?
     };
-    println!("request body: {}", req_body);
+    debug!("request body: {}", req_body);
+
+    info!("{} {}", method, rawuri);
 
     Some(HttpRequest {
         method: method, uri: rawuri, version: version, args: "",
@@ -170,7 +204,10 @@ fn response(mut stream: TcpStream, mut req: HttpRequest) {
             },
             None => false,
         },
-        _ => panic!("unsupported method"),
+        _ => {
+            warn!("unsupported method");
+            return;
+        }
     };
 
     /* internal location */
@@ -184,26 +221,29 @@ fn response(mut stream: TcpStream, mut req: HttpRequest) {
         _ => "root".to_string() + req.uri,
     };
 
-    println!("cgi: {}, path: {}", cgi, path);
+    debug!("cgi: {}, path: {}", cgi, path);
 
-    let mut buf = [0; 512];
+    let mut buf = String::new();
 
-    match File::open(path) {
-        Ok(mut f) => {
-            f.read(&mut buf).unwrap();
-            stream.write(SERVER_HEADER).unwrap();
-            stream.write(&buf).unwrap();
-        },
-        Err(e) => {
-            // println!("failed to open {}: {}", path, e); // TODO
-            println!("failed to open: {}", e);
-            stream.write(not_found()).unwrap();
+    if !cgi {
+        match File::open(&path) {
+            Ok(mut f) => {
+                f.read_to_string(&mut buf).unwrap();
+                stream.write(RESPONSE_HEADER).unwrap();
+                stream.write(buf.as_bytes()).unwrap();
+            },
+            Err(e) => {
+                error!("failed to open {}: {}", &path, e);
+                stream.write(not_found()).unwrap();
+            }
         }
+    } else {
+        stream.write(exec_cgi(req).as_bytes()).unwrap();
     }
 }
 
-fn cgi(path: &str, args: &str) {
-
+fn exec_cgi(req: HttpRequest) -> String {
+    "cgi".to_string()
 }
 
 fn main() {
@@ -221,7 +261,7 @@ fn main() {
                 accept(stream);
             }
             Err(e) => {
-                panic!(e);
+                error!("listenser: {}", e);
             }
         }
     }
