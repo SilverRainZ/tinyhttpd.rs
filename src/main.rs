@@ -13,6 +13,8 @@
 #[macro_use]
 extern crate log;
 
+mod tinylogger;
+
 use std::io::prelude::*;
 use std::str;
 use std::fs::File;
@@ -98,16 +100,20 @@ fn accept(mut stream: TcpStream) {
     }
 }
 
+macro_rules! parse_abort {
+    ($($arg:tt)*) => ({
+            warn!($($arg)*);
+            return None
+        })
+}
+
 fn parse(req: &str) -> Option<HttpRequest> {
     let mut line = req.split("\r\n");
 
     /* read request line */
     let req_line = match line.next() {
         Some(v) => v,
-        None => {
-            warn!("no request line found");
-            return None;
-        }
+        None => parse_abort!("no request line found"),
     };
     debug!("request line: {}", req_line);
 
@@ -116,34 +122,24 @@ fn parse(req: &str) -> Option<HttpRequest> {
     let method = match req_line.next() {
         Some(v) => {
             if v != "POST" && v != "GET" {
-                warn!("unsupported method");
-                return None;
+                parse_abort!("unsupported method");
             } else {
                 v
             }
         },
-        None => {
-            warn!("no method found in request line");
-            return None;
-        }
+        None => parse_abort!("no method found in request line"),
     };
     debug!("method: {}", method);
 
     let rawuri = match req_line.next() {
         Some(v) => v,
-        None => {
-            warn!("no uri found in request line");
-            return None;
-        }
+        None => parse_abort!("no uri found in request line"),
     };
     debug!("rawuri: {}", rawuri);
 
     let version = match req_line.next() {
         Some(v) => v,
-        None => {
-            warn!("no version found in request line");
-            return None;
-        }
+        None => parse_abort!("no version found in request line"),
     };
     debug!("version: {}", version);
 
@@ -153,10 +149,7 @@ fn parse(req: &str) -> Option<HttpRequest> {
         let req_header = match line.next() {
             Some("") => break,  // end of header
             Some(v) => v,
-            None => {
-                warn!("no request header found");
-                return None;
-            }
+            None => parse_abort!("no request header found"),
         };
 
         let head_entry = match req_header.find(": ") {
@@ -165,10 +158,7 @@ fn parse(req: &str) -> Option<HttpRequest> {
                 let val = &val[2..]; // skip ": "
                 HttpHeadEntry { key: key, val: val }
             },
-            None => {
-                warn!("no value found in header '{}'", req_header);
-                return None
-            }
+            None => parse_abort!("no value found in header '{}'", req_header),
         };
 
         debug!("header: key: {}, val: {}", head_entry.key, head_entry.val);
@@ -247,11 +237,13 @@ fn exec_cgi(req: HttpRequest) -> String {
 }
 
 fn main() {
+    tinylogger::init().unwrap();
+
     let port = 30528;
     let addr = "127.0.0.1";
     let addr = addr.to_string() + ":" + &port.to_string();
 
-    println!("listening on {}", addr);
+    info!("listening on {}", addr);
 
     let listenser = TcpListener::bind(&*addr).unwrap();
 
