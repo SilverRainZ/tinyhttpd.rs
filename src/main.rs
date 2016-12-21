@@ -19,6 +19,7 @@ use std::io::prelude::*;
 use std::str;
 use std::fs::File;
 use std::net::{TcpStream, TcpListener};
+use std::process::{Command, Stdio};
 
 /* const string and bytes */
 
@@ -228,12 +229,27 @@ fn response(mut stream: TcpStream, mut req: HttpRequest) {
             }
         }
     } else {
-        stream.write(exec_cgi(req).as_bytes()).unwrap();
+        stream.write(RESPONSE_HEADER).unwrap();
+        stream.write(exec_cgi(path, req).as_bytes()).unwrap();
     }
 }
 
-fn exec_cgi(req: HttpRequest) -> String {
-    "cgi".to_string()
+fn exec_cgi(path: String, req: HttpRequest) -> String {
+    // for GET: discard body
+    // for POST: read according Content-Length, TODO
+    info!("path: {}", path);
+    let child = Command::new(path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to execute child");
+
+    let output = child.wait_with_output()
+        .expect("failed to wait on child");
+
+    let res = str::from_utf8(&output.stdout).unwrap();
+    info!("cgi: {}", res);
+
+    res.to_string()
 }
 
 fn main() {
