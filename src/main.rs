@@ -3,9 +3,9 @@
  *  SilverRainZ <silverrain.zhang at gmail dot com>
  *
  *  - [x] http requset parse
- *  - [ ] url arguments reslove
+ *  - [x] url arguments reslove
  *  - [x] static file handle
- *  - [ ] cgi execute
+ *  - [x] cgi execute
  *  - [ ] dot removal procedure (RFC 3986)
  *
  *****************************************************************************/
@@ -20,6 +20,7 @@ use std::str;
 use std::fs::File;
 use std::net::{TcpStream, TcpListener};
 use std::process::{Command, Stdio};
+use std::os::unix::fs::PermissionsExt;
 
 /* const string and bytes */
 
@@ -29,25 +30,9 @@ static RESPONSE_HEADER: &'static [u8] =
       Server: tinyhttpd.rs/0.1.0\r\n\
       \r\n";
 
-fn welcome() -> &'static [u8] {
-    "HTTP/1.0 200 OK\r\n\
-     Content-type: text/html; charset=utf-8\r\n\
-     \r\n\
-     <html>\
-        <head>\
-            <title>君の名は!</title>\
-        </head>\
-        <body>\
-            <center>\
-                <h1>Welcome!</h1>\
-                <p>君の名は!</p>\
-            </center>\
-        </body>\
-     </html>".as_bytes()
-}
-
 fn not_found() -> &'static [u8] {
     "HTTP/1.0 404 NOT FOUND\r\n\
+     Server: tinyhttpd.rs/0.1.0\r\n\
      Content-Type: text/html; charset=utf-8\r\n\
      \r\n\
      <html>\
@@ -201,12 +186,6 @@ fn response(mut stream: TcpStream, mut req: HttpRequest) {
         }
     };
 
-    /* internal location */
-    if req.uri == "/welcome" {
-        stream.write(welcome()).unwrap();
-        return;
-    }
-
     let path = match req.uri.chars().last() {
         Some('/') =>  "root".to_string() + req.uri + "index.html",
         _ => "root".to_string() + req.uri,
@@ -214,31 +193,46 @@ fn response(mut stream: TcpStream, mut req: HttpRequest) {
 
     debug!("cgi: {}, path: {}", cgi, path);
 
-    let mut buf = String::new();
+    match File::open(&path) {
+        Ok(mut f) => {
+            match f.metadata() {
+                Ok(meta) => {
+                    /* mode = ___x__x__x */
+                    cgi = meta.permissions().mode() & 0o111 != 0;
+                }
+                Err(e) => {
+                    error!("failed to get metadata of '{}': {}", &path, e);
+                }
+            }
 
-    if !cgi {
-        match File::open(&path) {
-            Ok(mut f) => {
+            if cgi {
+                stream.write(RESPONSE_HEADER).unwrap();
+                stream.write(exec_cgi(path, req).as_bytes()).unwrap();
+            } else {
+                let mut buf = String::new();
+
                 f.read_to_string(&mut buf).unwrap();
                 stream.write(RESPONSE_HEADER).unwrap();
                 stream.write(buf.as_bytes()).unwrap();
-            },
-            Err(e) => {
-                error!("failed to open {}: {}", &path, e);
-                stream.write(not_found()).unwrap();
             }
+        },
+        Err(e) => {
+            error!("failed to open '{}': {}", &path, e);
+            stream.write(not_found()).unwrap();
         }
-    } else {
-        stream.write(RESPONSE_HEADER).unwrap();
-        stream.write(exec_cgi(path, req).as_bytes()).unwrap();
     }
+}
+
+fn serv_file(path: String, req: HttpRequest) {
 }
 
 fn exec_cgi(path: String, req: HttpRequest) -> String {
     // for GET: discard body
     // for POST: read according Content-Length, TODO
-    info!("path: {}", path);
+    info!("path: {}, args: {}", path, req.args);
     let child = Command::new(path)
+        .env("REQUEST_METHOD", req.method)
+        .env("QUERY_STRING", req.args)
         .stdout(Stdio::piped())
         .spawn()
         .expect("failed to execute child");
@@ -246,14 +240,11 @@ fn exec_cgi(path: String, req: HttpRequest) -> String {
     let output = child.wait_with_output()
         .expect("failed to wait on child");
 
-    let res = str::from_utf8(&output.stdout).unwrap();
-    info!("cgi: {}", res);
-
-    res.to_string()
+    str::from_utf8(&output.stdout).unwrap().to_string()
 }
 
 fn main() {
-    tinylogger::init().unwrap();
+    tinylogger::init(log::LogLevelFilter::Debug).unwrap();
 
     let port = 30528;
     let addr = "127.0.0.1";
