@@ -16,7 +16,9 @@ extern crate log;
 mod tinylogger;
 
 use std::io::prelude::*;
+use std::io::Bytes;
 use std::str;
+// use std::io::Bytes;
 use std::fs::File;
 use std::net::{TcpStream, TcpListener};
 use std::process::{Command, Stdio};
@@ -48,135 +50,142 @@ fn not_found() -> &'static [u8] {
 
 /* struct */
 
-struct HttpHeadEntry<'req> {
-    key: &'req str,
-    val: &'req str,
+struct HttpRequestLine {
+    method: String,
+    uri: String,
+    version: String,
 }
 
-struct HttpRequest<'req> {
-    /* request line */
-    method: &'req str,
-    uri: &'req str,
-    version: &'req str,
-    args: &'req str,
+struct HttpHeadEntry {
+    key: String,
+    val: String,
+}
 
-    /* request header */
-    head_entrys: Vec<HttpHeadEntry<'req>>,
-
-    /* request body */
-    body: &'req str,
+struct HttpRequest {
+    req_line: HttpRequestLine,
+    args: String,
+    head_entrys: Vec<HttpHeadEntry>,
+    body: String,
 }
 
 /* implement */
 
-fn accept(mut stream: TcpStream) {
-    let mut buf = [0; 512];
-    // let mut req: HttpRequest = HttpRequest{ .. };
+fn read_line(bytes: &mut Bytes<TcpStream>) -> Option<String> {
+    let mut crlf = false;
+    let mut buf:Vec<u8> = Vec::new();
 
-    stream.read(&mut buf).unwrap();
+    loop {
+        match bytes.next() {
+            Some(Ok(b)) => {
+                buf.push(b);
+                crlf = match b {
+                    b'\r' => true,
+                    b'\n' => if crlf { break } else { false },
+                    _ => false,
+                }
+            }
+            Some(Err(e)) => {
+                error!("read error: {}", e);
+                return None
+            }
+            None => {
+                error!("unterminated line");
+                return None
+            }
+        }
+    }
 
     match str::from_utf8(&buf) {
-        Ok(s) => {
-            match parse(s) {
-                Some(req) => response(stream, req),
-                None => error!("failed to parse http request"),
-            }
-        },
-        Err(e) => error!("invaild utf-8 sequcence {}", e),
+        Ok(s) => Some(s.to_string()),
+        Err(e) => {
+            error!("invail utf-8 sequence, {}", e);
+            None
+        }
     }
 }
 
-macro_rules! parse_abort {
-    ($($arg:tt)*) => ({
-            warn!($($arg)*);
-            return None
+fn accept(mut stream: TcpStream) {
+    let mut bytes = stream.bytes();
+    let mut lines:Vec<String> = Vec::new();
+
+    let line = match read_line(&mut bytes) {
+        Some(s) => s,
+        None => return,
+    };
+    let req_line = match parse_req_line(&line) {
+        Some(v) => v,
+        None => return,
+    };
+
+    let mut head_entrys:Vec<HttpHeadEntry> = Vec::new();
+    loop {
+        let line = match read_line(&mut bytes) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // lines.push(line);
+        if line == "\r\n" { break }
+
+        match parse_header_entry(line) {
+            Some(v) => head_entrys.push(v),
+            None => return,
+        }
+    }
+}
+
+macro_rules! unwrap_or_return {
+    ($exp:expr, $msg: expr) => ({
+            let v = match $exp {
+                Some(v) => v,
+                None => {
+                    error!($msg);
+                    return None
+                }
+            };
+            v
         })
 }
 
-fn parse(req: &str) -> Option<HttpRequest> {
-    let mut line = req.split("\r\n");
-
-    /* read request line */
-    let req_line = match line.next() {
-        Some(v) => v,
-        None => parse_abort!("no request line found"),
-    };
-    debug!("request line: {}", req_line);
-
+fn parse_req_line(req_line: &str) -> Option<HttpRequestLine> {
     let mut req_line =  req_line.split_whitespace();
 
-    let method = match req_line.next() {
-        Some(v) => {
-            if v != "POST" && v != "GET" {
-                parse_abort!("unsupported method");
-            } else {
-                v
-            }
-        },
-        None => parse_abort!("no method found in request line"),
-    };
+    let method = unwrap_or_return!(req_line.next(), "no method found in request line");
     debug!("method: {}", method);
 
-    let rawuri = match req_line.next() {
-        Some(v) => v,
-        None => parse_abort!("no uri found in request line"),
-    };
+    let rawuri = unwrap_or_return!(req_line.next(), "no uri found in request line");
     debug!("rawuri: {}", rawuri);
 
-    let version = match req_line.next() {
-        Some(v) => v,
-        None => parse_abort!("no version found in request line"),
-    };
+    let version = unwrap_or_return!(req_line.next(), "no version found in request line");
     debug!("version: {}", version);
 
-    /* read request header */
-    let mut head_entrys: Vec<HttpHeadEntry> = Vec::new();
-    loop {
-        let req_header = match line.next() {
-            Some("") => break,  // end of header
-            Some(v) => v,
-            None => parse_abort!("no request header found"),
-        };
-
-        let head_entry = match req_header.find(": ") {
-            Some(idx) => {
-                let (key, val) = req_header.split_at(idx);
-                let val = &val[2..]; // skip ": "
-                HttpHeadEntry { key: key, val: val }
-            },
-            None => parse_abort!("no value found in header '{}'", req_header),
-        };
-
-        debug!("header: key: {}, val: {}", head_entry.key, head_entry.val);
-        head_entrys.push(head_entry);
-    }
-
-    /* read request body */
-    let req_body = match line.next() {
-        Some(v) => v,
-        None => "", // OK?
-    };
-    debug!("request body: {}", req_body);
-
-    info!("{} {}", method, rawuri);
-
-    Some(HttpRequest {
-        method: method, uri: rawuri, version: version, args: "",
-        head_entrys: head_entrys,
-        body: req_body,
+    Some(HttpRequestLine {
+        method: method.to_string(),
+        uri: rawuri.to_string(),
+        version: version.to_string(),
     })
 }
 
+fn parse_header_entry<'req>(head_entry: String) -> Option<HttpHeadEntry> {
+    let idx = unwrap_or_return!(head_entry.find(": "), "no value found in header entry");
+    let (key, val) = head_entry.split_at(idx);
+    let val = &val[2..]; // skip ": "
+    debug!("header: key: {}, val: {}", key, val);
+
+    Some(HttpHeadEntry { key: key.to_string(), val: val.to_string() })
+}
+
 fn response(mut stream: TcpStream, mut req: HttpRequest) {
-    let mut cgi = match req.method {
+    let mut cgi = match req.req_line.method.as_str() {
         "POST" => true,
-        "GET" => match req.uri.find("?") {
+        "GET" => match req.req_line.uri.find("?") {
             Some(idx) => {
-                let (uri, args) = req.uri.split_at(idx);
-                    let args = &args[1..]; // skip "?"
-                    req.uri = uri;
-                    req.args = args;
-                    true
+                let rawuri = req.req_line.uri.clone();
+                let (uri, args) = rawuri.split_at(idx);
+                let args = &args[1..]; // skip "?"
+                req.req_line.uri = uri.to_string();
+                req.args = args.to_string();
+                true
             },
             None => false,
         },
@@ -186,9 +195,9 @@ fn response(mut stream: TcpStream, mut req: HttpRequest) {
         }
     };
 
-    let path = match req.uri.chars().last() {
-        Some('/') =>  "root".to_string() + req.uri + "index.html",
-        _ => "root".to_string() + req.uri,
+    let path = match req.req_line.uri.chars().last() {
+        Some('/') =>  "root".to_string() + &req.req_line.uri + "index.html",
+        _ => "root".to_string() + &req.req_line.uri,
     };
 
     debug!("cgi: {}, path: {}", cgi, path);
@@ -231,7 +240,7 @@ fn exec_cgi(path: String, req: HttpRequest) -> String {
     // for POST: read according Content-Length, TODO
     info!("path: {}, args: {}", path, req.args);
     let child = Command::new(path)
-        .env("REQUEST_METHOD", req.method)
+        .env("REQUEST_METHOD", req.req_line.method)
         .env("QUERY_STRING", req.args)
         .stdout(Stdio::piped())
         .spawn()
