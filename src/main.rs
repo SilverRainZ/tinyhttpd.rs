@@ -54,6 +54,7 @@ struct HttpRequestLine {
     method: String,
     uri: String,
     version: String,
+    args: Option<String>,
 }
 
 struct HttpHeadEntry {
@@ -63,14 +64,14 @@ struct HttpHeadEntry {
 
 struct HttpRequest {
     req_line: HttpRequestLine,
-    args: String,
     head_entrys: Vec<HttpHeadEntry>,
-    body: String,
+    body: Option<String>,
 }
 
 /* implement */
 
-fn read_line(bytes: &mut Bytes<TcpStream>) -> Option<String> {
+fn read_line(stream: &mut TcpStream) -> Option<String> {
+    let mut bytes = stream.bytes();
     let mut crlf = false;
     let mut buf:Vec<u8> = Vec::new();
 
@@ -80,7 +81,15 @@ fn read_line(bytes: &mut Bytes<TcpStream>) -> Option<String> {
                 buf.push(b);
                 crlf = match b {
                     b'\r' => true,
-                    b'\n' => if crlf { break } else { false },
+                    b'\n' =>
+                        if crlf {
+                            // pop "\r\n"
+                            buf.pop();
+                            buf.pop();
+                            break
+                        } else {
+                            false
+                        },
                     _ => false,
                 }
             }
@@ -105,10 +114,9 @@ fn read_line(bytes: &mut Bytes<TcpStream>) -> Option<String> {
 }
 
 fn accept(mut stream: TcpStream) {
-    let mut bytes = stream.bytes();
     let mut lines:Vec<String> = Vec::new();
 
-    let line = match read_line(&mut bytes) {
+    let line = match read_line(&mut stream) {
         Some(s) => s,
         None => return,
     };
@@ -117,21 +125,31 @@ fn accept(mut stream: TcpStream) {
         None => return,
     };
 
+    info!("{} {}", req_line.method, req_line.uri);
+
     let mut head_entrys:Vec<HttpHeadEntry> = Vec::new();
     loop {
-        let line = match read_line(&mut bytes) {
+        let line = match read_line(&mut stream) {
             Some(s) => s,
             None => return,
         };
 
         // lines.push(line);
-        if line == "\r\n" { break }
+        if line == "" { break }
 
         match parse_header_entry(line) {
             Some(v) => head_entrys.push(v),
             None => return,
         }
     }
+
+    let mut request = HttpRequest {
+        req_line: req_line,
+        head_entrys: head_entrys,
+        body: None,
+    };
+
+    response(stream, request);
 }
 
 macro_rules! unwrap_or_return {
@@ -163,10 +181,11 @@ fn parse_req_line(req_line: &str) -> Option<HttpRequestLine> {
         method: method.to_string(),
         uri: rawuri.to_string(),
         version: version.to_string(),
+        args: None,
     })
 }
 
-fn parse_header_entry<'req>(head_entry: String) -> Option<HttpHeadEntry> {
+fn parse_header_entry(head_entry: String) -> Option<HttpHeadEntry> {
     let idx = unwrap_or_return!(head_entry.find(": "), "no value found in header entry");
     let (key, val) = head_entry.split_at(idx);
     let val = &val[2..]; // skip ": "
@@ -175,20 +194,24 @@ fn parse_header_entry<'req>(head_entry: String) -> Option<HttpHeadEntry> {
     Some(HttpHeadEntry { key: key.to_string(), val: val.to_string() })
 }
 
+fn parse_query_string(req_line: &mut HttpRequestLine) -> bool {
+    match req_line.uri.find("?") {
+        Some(idx) => {
+            let rawuri = req_line.uri.clone();
+            let (uri, args) = rawuri.split_at(idx);
+            let args = &args[1..]; // skip "?"
+            req_line.uri = uri.to_string();
+            req_line.args = Some(args.to_string());
+            true
+        }
+        None => false,
+    }
+}
+
 fn response(mut stream: TcpStream, mut req: HttpRequest) {
     let mut cgi = match req.req_line.method.as_str() {
         "POST" => true,
-        "GET" => match req.req_line.uri.find("?") {
-            Some(idx) => {
-                let rawuri = req.req_line.uri.clone();
-                let (uri, args) = rawuri.split_at(idx);
-                let args = &args[1..]; // skip "?"
-                req.req_line.uri = uri.to_string();
-                req.args = args.to_string();
-                true
-            },
-            None => false,
-        },
+        "GET" => parse_query_string(&mut req.req_line),
         _ => {
             warn!("unsupported method");
             return;
@@ -238,10 +261,10 @@ fn serv_file(path: String, req: HttpRequest) {
 fn exec_cgi(path: String, req: HttpRequest) -> String {
     // for GET: discard body
     // for POST: read according Content-Length, TODO
-    info!("path: {}, args: {}", path, req.args);
+    info!("path: {}, args: {:?}", path, req.req_line.args);
     let child = Command::new(path)
         .env("REQUEST_METHOD", req.req_line.method)
-        .env("QUERY_STRING", req.args)
+        .env("QUERY_STRING", req.req_line.args.unwrap()) // TODO
         .stdout(Stdio::piped())
         .spawn()
         .expect("failed to execute child");
